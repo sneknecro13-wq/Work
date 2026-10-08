@@ -93,19 +93,18 @@ jobs:
           import de.robv.android.xposed.XposedHelpers;
           import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-          /**
-           * Хук у system_server: DisplayDevice.setProjectionLocked(t, orientation, layerStackRect, displayRect).
-           * Коли активний wm size, displayRect центрований на панелі. Ми переписуємо його на
-           * (0, 0, PHYS_W, WORK_H): картинка стає до верху і розтягується на всю робочу зону.
-           * displayRect це той самий об'єкт mTempDisplayRect, з якого пізніше береться viewport для тачу.
-           */
           public class Hook implements IXposedHookLoadPackage {
-              // Підлаштуй під свій екран
-              static final int PHYS_W = 1440;
-              static final int PHYS_H = 3120;
-              static final int WORK_H = 1510; // висота живої зони в пікселях
-
               static final String TAG = "ScreenShift";
+
+              // Безпечний метод читання налаштувань без помилок компіляції
+              private static int getSysProp(String key, int defVal) {
+                  try {
+                      Class<?> clazz = Class.forName("android.os.SystemProperties");
+                      return (Integer) clazz.getMethod("getInt", String.class, int.class).invoke(null, key, defVal);
+                  } catch (Exception e) {
+                      return defVal;
+                  }
+              }
 
               @Override
               public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -113,7 +112,7 @@ jobs:
                   try {
                       Class<?> dd = XposedHelpers.findClass(
                               "com.android.server.display.DisplayDevice", lpparam.classLoader);
-                      int n = XposedBridge.hookAllMethods(dd, "setProjectionLocked", new XC_MethodHook() {
+                      XposedBridge.hookAllMethods(dd, "setProjectionLocked", new XC_MethodHook() {
                           @Override
                           protected void beforeHookedMethod(MethodHookParam param) {
                               try {
@@ -122,8 +121,7 @@ jobs:
                                   XposedBridge.log(TAG + ": shift failed: " + t);
                               }
                           }
-                      }).size();
-                      XposedBridge.log(TAG + ": hooked setProjectionLocked x" + n);
+                      });
                   } catch (Throwable t) {
                       XposedBridge.log(TAG + ": hook failed: " + t);
                   }
@@ -131,24 +129,51 @@ jobs:
 
               private static void shift(XC_MethodHook.MethodHookParam param) {
                   Object[] a = param.args;
-                  Rect disp = null;
-                  for (int i = a.length - 1; i >= 0; i--) {
-                      if (a[i] instanceof Rect) { disp = (Rect) a[i]; break; }
+                  Rect layerRect = null;
+                  Rect dispRect = null;
+                  
+                  // Знаходимо логічний екран (layerStackRect) і фізичну зону (displayRect)
+                  for (int i = 0; i < a.length; i++) {
+                      if (a[i] instanceof Rect) {
+                          if (layerRect == null) {
+                              layerRect = (Rect) a[i];
+                          } else {
+                              dispRect = (Rect) a[i];
+                              break;
+                          }
+                      }
                   }
-                  if (disp == null) return;
+                  if (dispRect == null || layerRect == null) return;
 
-                  // тільки без повороту панелі
+                  // Ігноруємо, якщо екран повернуто (ландшафтний режим)
                   if (a.length > 1 && a[1] instanceof Integer && (Integer) a[1] != 0) return;
 
                   Object info = XposedHelpers.callMethod(param.thisObject, "getDisplayDeviceInfoLocked");
                   if (info == null) return;
-                  int w = XposedHelpers.getIntField(info, "width");
-                  int h = XposedHelpers.getIntField(info, "height");
-                  if (w != PHYS_W || h != PHYS_H) return;   // не наша внутрішня панель
+                  int physW = XposedHelpers.getIntField(info, "width");
+                  int physH = XposedHelpers.getIntField(info, "height");
 
-                  if (disp.height() >= PHYS_H) return;       // wm size не активний, не чіпаємо
+                  // Перевіряємо, чи це внутрішня матриця смартфона (за замовчуванням 1440x3120)
+                  int targetW = getSysProp("persist.sys.shift.pw", 1440);
+                  int targetH = getSysProp("persist.sys.shift.ph", 3120);
+                  if (physW != targetW || physH != targetH) return;
 
-                  disp.set(0, 0, PHYS_W, WORK_H);
+                  // Зчитуємо фізичні межі (displayRect) — куди розтягнути картинку
+                  int dispL = getSysProp("persist.sys.shift.dl", 0);
+                  int dispT = getSysProp("persist.sys.shift.dt", 0);
+                  int dispR = getSysProp("persist.sys.shift.dr", targetW);
+                  int dispB = getSysProp("persist.sys.shift.db", 1510);
+
+                  dispRect.set(dispL, dispT, dispR, dispB);
+                  
+                  // Якщо потрібно форсувати логічний розмір екрана прямо тут (замість wm size)
+                  if (getSysProp("persist.sys.shift.force_layer", 0) == 1) {
+                      int layerL = getSysProp("persist.sys.shift.ll", 0);
+                      int layerT = getSysProp("persist.sys.shift.lt", 0);
+                      int layerR = getSysProp("persist.sys.shift.lr", targetW);
+                      int layerB = getSysProp("persist.sys.shift.lb", targetH);
+                      layerRect.set(layerL, layerT, layerR, layerB);
+                  }
               }
           }
           EOF
@@ -157,3 +182,4 @@ jobs:
         with:
           name: ScreenShift-apk
           path: app/build/outputs/apk/debug/*.apk
+          
