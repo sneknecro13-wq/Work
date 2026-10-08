@@ -1,0 +1,159 @@
+name: build
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Generate project
+        run: |
+          mkdir -p app/src/main/java/dev/alx/screenshift app/src/main/assets app/src/main/res/values
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven("https://api.xposed.info/")
+              }
+          }
+          rootProject.name = "ScreenShift"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+          }
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins { id("com.android.application") }
+
+          android {
+              namespace = "dev.alx.screenshift"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "dev.alx.screenshift"
+                  minSdk = 29
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              compileOnly("de.robv.android.xposed:api:82")
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="ScreenShift"
+                  android:allowBackup="false">
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription"
+                      android:value="Піднімає зменшену картинку до верху робочої зони екрана" />
+                  <meta-data android:name="xposedminversion" android:value="82" />
+                  <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/values/arrays.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string-array name="xposed_scope">
+                  <item>android</item>
+              </string-array>
+          </resources>
+          EOF
+          cat > app/src/main/assets/xposed_init <<'EOF'
+          dev.alx.screenshift.Hook
+          EOF
+          cat > app/src/main/java/dev/alx/screenshift/Hook.java <<'EOF'
+          package dev.alx.screenshift;
+
+          import android.graphics.Rect;
+
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.XposedHelpers;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+          /**
+           * Хук у system_server: DisplayDevice.setProjectionLocked(t, orientation, layerStackRect, displayRect).
+           * Коли активний wm size, displayRect центрований на панелі. Ми переписуємо його на
+           * (0, 0, PHYS_W, WORK_H): картинка стає до верху і розтягується на всю робочу зону.
+           * displayRect це той самий об'єкт mTempDisplayRect, з якого пізніше береться viewport для тачу.
+           */
+          public class Hook implements IXposedHookLoadPackage {
+              // Підлаштуй під свій екран
+              static final int PHYS_W = 1440;
+              static final int PHYS_H = 3120;
+              static final int WORK_H = 1510; // висота живої зони в пікселях
+
+              static final String TAG = "ScreenShift";
+
+              @Override
+              public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+                  if (!"android".equals(lpparam.packageName)) return;
+                  try {
+                      Class<?> dd = XposedHelpers.findClass(
+                              "com.android.server.display.DisplayDevice", lpparam.classLoader);
+                      int n = XposedBridge.hookAllMethods(dd, "setProjectionLocked", new XC_MethodHook() {
+                          @Override
+                          protected void beforeHookedMethod(MethodHookParam param) {
+                              try {
+                                  shift(param);
+                              } catch (Throwable t) {
+                                  XposedBridge.log(TAG + ": shift failed: " + t);
+                              }
+                          }
+                      }).size();
+                      XposedBridge.log(TAG + ": hooked setProjectionLocked x" + n);
+                  } catch (Throwable t) {
+                      XposedBridge.log(TAG + ": hook failed: " + t);
+                  }
+              }
+
+              private static void shift(XC_MethodHook.MethodHookParam param) {
+                  Object[] a = param.args;
+                  Rect disp = null;
+                  for (int i = a.length - 1; i >= 0; i--) {
+                      if (a[i] instanceof Rect) { disp = (Rect) a[i]; break; }
+                  }
+                  if (disp == null) return;
+
+                  // тільки без повороту панелі
+                  if (a.length > 1 && a[1] instanceof Integer && (Integer) a[1] != 0) return;
+
+                  Object info = XposedHelpers.callMethod(param.thisObject, "getDisplayDeviceInfoLocked");
+                  if (info == null) return;
+                  int w = XposedHelpers.getIntField(info, "width");
+                  int h = XposedHelpers.getIntField(info, "height");
+                  if (w != PHYS_W || h != PHYS_H) return;   // не наша внутрішня панель
+
+                  if (disp.height() >= PHYS_H) return;       // wm size не активний, не чіпаємо
+
+                  disp.set(0, 0, PHYS_W, WORK_H);
+              }
+          }
+          EOF
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScreenShift-apk
+          path: app/build/outputs/apk/debug/*.apk
