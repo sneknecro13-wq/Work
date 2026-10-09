@@ -95,6 +95,7 @@ jobs:
 
           public class Hook implements IXposedHookLoadPackage {
               static final String TAG = "ScreenShift";
+              private static int lastRot = -1;
 
               // Безпечний метод читання налаштувань без помилок компіляції
               private static int getSysProp(String key, int defVal) {
@@ -131,7 +132,7 @@ jobs:
                   Object[] a = param.args;
                   Rect layerRect = null;
                   Rect dispRect = null;
-                  
+
                   // Знаходимо логічний екран (layerStackRect) і фізичну зону (displayRect)
                   for (int i = 0; i < a.length; i++) {
                       if (a[i] instanceof Rect) {
@@ -145,8 +146,12 @@ jobs:
                   }
                   if (dispRect == null || layerRect == null) return;
 
-                  // Ігноруємо, якщо екран повернуто (ландшафтний режим)
-                  if (a.length > 1 && a[1] instanceof Integer && (Integer) a[1] != 0) return;
+                  // Поворот: 0 = портрет, 1 = 90, 2 = 180, 3 = 270
+                  int rot = (a.length > 1 && a[1] instanceof Integer) ? (Integer) a[1] : 0;
+                  // Якщо в альбомі зона опиняється з протилежного боку: setprop persist.sys.shift.rotflip 1
+                  if (getSysProp("persist.sys.shift.rotflip", 0) == 1 && (rot == 1 || rot == 3)) {
+                      rot = 4 - rot;
+                  }
 
                   Object info = XposedHelpers.callMethod(param.thisObject, "getDisplayDeviceInfoLocked");
                   if (info == null) return;
@@ -158,16 +163,36 @@ jobs:
                   int targetH = getSysProp("persist.sys.shift.ph", 3120);
                   if (physW != targetW || physH != targetH) return;
 
-                  // Зчитуємо фізичні межі (displayRect) — куди розтягнути картинку
+                  // Робоча зона в координатах панелі (портрет): куди розтягнути картинку
                   int dispL = getSysProp("persist.sys.shift.dl", 0);
                   int dispT = getSysProp("persist.sys.shift.dt", 0);
                   int dispR = getSysProp("persist.sys.shift.dr", targetW);
                   int dispB = getSysProp("persist.sys.shift.db", 1510);
 
-                  dispRect.set(dispL, dispT, dispR, dispB);
-                  
-                  // Якщо потрібно форсувати логічний розмір екрана прямо тут (замість wm size)
-                  if (getSysProp("persist.sys.shift.force_layer", 0) == 1) {
+                  // Переводимо прямокутник у повернуту систему координат, яку очікує фреймворк
+                  int l, t, r, b;
+                  switch (rot) {
+                      case 1:
+                          l = dispT; t = physW - dispR; r = dispB; b = physW - dispL;
+                          break;
+                      case 2:
+                          l = physW - dispR; t = physH - dispB; r = physW - dispL; b = physH - dispT;
+                          break;
+                      case 3:
+                          l = physH - dispB; t = dispL; r = physH - dispT; b = dispR;
+                          break;
+                      default:
+                          l = dispL; t = dispT; r = dispR; b = dispB;
+                  }
+
+                  if (rot != lastRot) {
+                      lastRot = rot;
+                      XposedBridge.log(TAG + ": rot=" + rot + " rect=" + l + "," + t + "," + r + "," + b);
+                  }
+                  dispRect.set(l, t, r, b);
+
+                  // Форсування логічного розміру (замість wm size), тільки в портреті
+                  if (rot == 0 && getSysProp("persist.sys.shift.force_layer", 0) == 1) {
                       int layerL = getSysProp("persist.sys.shift.ll", 0);
                       int layerT = getSysProp("persist.sys.shift.lt", 0);
                       int layerR = getSysProp("persist.sys.shift.lr", targetW);
@@ -182,4 +207,3 @@ jobs:
         with:
           name: ScreenShift-apk
           path: app/build/outputs/apk/debug/*.apk
-          
